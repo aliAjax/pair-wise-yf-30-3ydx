@@ -69,6 +69,74 @@ class PharmacovigilanceFlowTest(unittest.TestCase):
                                      "causality": "related", "rationale": "x", "received_at": iso(utcnow())})
         self.assertEqual(ctx.exception.status, 403)
 
+    def test_followup_recalculates_unsubmitted_report_and_overdue_list(self):
+        old = iso(utcnow() - timedelta(days=100))
+        case = self.svc.create_case(
+            "reporter-a", "reporter", "CN",
+            {"patient_ref": "P-9", "region": "CN", "product": "DrugB", "event_term": "皮疹",
+             "source": "email", "dedupe_key": "intake-3", "received_at": old, "serious": False},
+        )["case"]
+        report = self.svc.create_report(case["id"], "lead-cn", "regional_lead", "CN", {"country": "CN"})
+        self.assertEqual(report["status"], "pending")
+        self.assertEqual(len(self.svc.overdue("regional_lead", "CN")), 1)
+        self.svc.add_followup(case["id"], "reporter-a", "reporter", "CN",
+                              {"content": "更正收到时间", "source": "phone", "expected_revision": 1,
+                               "received_at": iso(utcnow())})
+        detail = self.svc.get_case(case["id"], "global_admin", "")
+        updated = detail["reports"][0]
+        self.assertEqual(updated["due_at"], detail["case"]["report_due_at"])
+        self.assertNotEqual(updated["due_at"], report["due_at"])
+        self.assertEqual(self.svc.overdue("regional_lead", "CN"), [])
+
+    def test_followup_flags_submitted_report_for_resubmit_and_blocks_until_review(self):
+        case = self.create("intake-4")
+        report = self.svc.create_report(case["id"], "lead-cn", "regional_lead", "CN", {"country": "CN"})
+        self.svc.submit_report(report["id"], "lead-cn", "regional_lead", "CN", {})
+        self.svc.add_followup(case["id"], "reporter-a", "reporter", "CN",
+                              {"content": "补充出院记录", "source": "fax", "expected_revision": 1})
+        pending = self.svc.get_case(case["id"], "global_admin", "")["reports"][0]
+        self.assertEqual(pending["status"], "resubmit_pending")
+        self.assertEqual(pending["submitted_by"], "lead-cn")
+        self.assertIsNotNone(pending["submitted_at"])
+        self.assertEqual(pending["first_submitted_by"], "lead-cn")
+        with self.assertRaises(ApiError) as ctx:
+            self.svc.submit_report(report["id"], "lead-cn", "regional_lead", "CN", {})
+        self.assertEqual(ctx.exception.code, "severity_review_required")
+        with self.assertRaises(ApiError) as ctx:
+            self.svc.submit_report(report["id"], "lead-us", "regional_lead", "US", {})
+        self.assertEqual(ctx.exception.status, 403)
+        self.svc.medical_review(case["id"], "reviewer-1", "medical_reviewer",
+                                {"expected_revision": 2, "serious": True, "fatal": False,
+                                 "causality": "possibly_related", "rationale": "随访信息已复核",
+                                 "received_at": iso(utcnow())})
+        resubmitted = self.svc.submit_report(report["id"], "lead-cn2", "regional_lead", "CN", {})
+        self.assertEqual(resubmitted["report"]["status"], "submitted")
+        self.assertEqual(resubmitted["report"]["submitted_by"], "lead-cn2")
+        self.assertEqual(resubmitted["report"]["first_submitted_by"], "lead-cn")
+
+    def test_medical_review_escalation_flags_submitted_report_overdue(self):
+        old = iso(utcnow() - timedelta(days=30))
+        case = self.svc.create_case(
+            "reporter-a", "reporter", "CN",
+            {"patient_ref": "P-7", "region": "CN", "product": "DrugC", "event_term": "恶心",
+             "source": "email", "dedupe_key": "intake-5", "received_at": old, "serious": False},
+        )["case"]
+        report = self.svc.create_report(case["id"], "lead-cn", "regional_lead", "CN", {"country": "CN"})
+        submitted = self.svc.submit_report(report["id"], "lead-cn", "regional_lead", "CN", {})
+        self.assertEqual(submitted["report"]["late"], 0)
+        self.svc.medical_review(case["id"], "reviewer-1", "medical_reviewer",
+                                {"expected_revision": 1, "serious": True, "fatal": True,
+                                 "causality": "related", "rationale": "死亡证明已核验", "received_at": old})
+        detail = self.svc.get_case(case["id"], "global_admin", "")
+        flagged = detail["reports"][0]
+        self.assertEqual(flagged["status"], "resubmit_pending")
+        self.assertEqual(flagged["due_at"], detail["case"]["report_due_at"])
+        self.assertEqual(flagged["first_submitted_by"], "lead-cn")
+        self.assertEqual([r["id"] for r in self.svc.overdue("regional_lead", "CN")], [report["id"]])
+        resubmitted = self.svc.submit_report(report["id"], "lead-cn", "regional_lead", "CN", {})
+        self.assertEqual(resubmitted["report"]["status"], "submitted")
+        self.assertEqual(resubmitted["report"]["late"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,9 +18,9 @@ python3 app.py --db pharmacovigilance.db
 
 - `POST /api/cases`：录入案例，`dedupe_key` 相同则返回已存在案例。
 - `GET /api/cases`、`GET /api/cases/{id}`：按权限查询。
-- `POST /api/cases/{id}/followups`：用 `expected_revision` 防止覆盖随访。
-- `POST /api/cases/{id}/medical-review`：医学审核员更新严重性、死亡和关联性。
-- `POST /api/cases/{id}/reports`、`POST /api/reports/{id}/submit`：生成并提交分国家报告。
+- `POST /api/cases/{id}/followups`：用 `expected_revision` 防止覆盖随访；随访后同案未提交报告按新时限重算，已提交报告转待重报。
+- `POST /api/cases/{id}/medical-review`：医学审核员更新严重性、死亡和关联性；同样联动更新同案分国家报告。
+- `POST /api/cases/{id}/reports`、`POST /api/reports/{id}/submit`：生成并提交分国家报告。待重报报告须医学审核覆盖当前严重性后才能重报，否则返回 409；首次提交人与时间保留在 `first_submitted_by/at`。
 - `POST /api/cases/{id}/merge`：全局管理员合并重复案例。
 - `POST /api/escalate-overdue`、`GET /api/overdue`：逾期检查与升级。
 

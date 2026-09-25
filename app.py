@@ -126,6 +126,9 @@ class Repository:
                 submitted_at TEXT,
                 submitted_by TEXT,
                 late INTEGER NOT NULL DEFAULT 0,
+                resubmit_review_revision INTEGER,
+                first_submitted_at TEXT,
+                first_submitted_by TEXT,
                 UNIQUE(case_id, country)
             );
             CREATE TABLE IF NOT EXISTS medical_reviews (
@@ -151,6 +154,15 @@ class Repository:
             );
             """
         )
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(reports)")}
+        if "resubmit_review_revision" not in columns:
+            self.conn.execute("ALTER TABLE reports ADD COLUMN resubmit_review_revision INTEGER")
+        if "first_submitted_at" not in columns:
+            self.conn.execute("ALTER TABLE reports ADD COLUMN first_submitted_at TEXT")
+            self.conn.execute("ALTER TABLE reports ADD COLUMN first_submitted_by TEXT")
+            self.conn.execute(
+                "UPDATE reports SET first_submitted_at=submitted_at,first_submitted_by=submitted_by WHERE submitted_at IS NOT NULL"
+            )
 
     @staticmethod
     def audit(conn: sqlite3.Connection, case_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -257,6 +269,32 @@ class PharmacovigilanceService:
         sql += " ORDER BY received_at DESC,id DESC"
         return [dict(r) for r in self.repo.conn.execute(sql, args)]
 
+    def _sync_reports_after_case_update(self, conn: sqlite3.Connection, case_id: int, actor: str, role: str,
+                                        due: datetime, review_revision: int) -> None:
+        """随访或医学裁定后同步分国家报告：未提交的按新时限重算，已提交的转待重报。
+
+        review_revision 表示重报前必须由医学审核覆盖的案例版本。
+        """
+        due_iso = iso(due)
+        reports = conn.execute("SELECT * FROM reports WHERE case_id=?", (case_id,)).fetchall()
+        for report in reports:
+            status = report["status"]
+            if status in {"pending", "overdue"}:
+                if report["due_at"] == due_iso:
+                    continue
+                conn.execute("UPDATE reports SET due_at=? WHERE id=?", (due_iso, report["id"]))
+                Repository.audit(conn, case_id, actor, role, "report_deadline_recalculated",
+                                 {"report_id": report["id"], "country": report["country"], "due_at": due_iso})
+            elif status in {"submitted", "resubmit_pending"}:
+                conn.execute(
+                    "UPDATE reports SET status='resubmit_pending',due_at=?,resubmit_review_revision=? WHERE id=?",
+                    (due_iso, review_revision, report["id"]),
+                )
+                Repository.audit(conn, case_id, actor, role, "report_resubmit_required",
+                                 {"report_id": report["id"], "country": report["country"],
+                                  "submitted_by": report["submitted_by"], "submitted_at": report["submitted_at"],
+                                  "resubmit_review_revision": review_revision})
+
     def add_followup(self, case_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
         content = str(body.get("content", "")).strip()
         source = str(body.get("source", "")).strip()
@@ -284,6 +322,7 @@ class PharmacovigilanceService:
                 "UPDATE cases SET revision=?,received_at=?,report_due_at=?,updated_at=? WHERE id=?",
                 (revision, iso(received), iso(due), iso(), case_id),
             )
+            self._sync_reports_after_case_update(conn, case_id, actor, role, due, revision)
             Repository.audit(conn, case_id, actor, role, "followup_added", {"revision": revision, "source": source})
             return {"case": dict(self._case(conn, case_id)), "revision": revision}
 
@@ -319,6 +358,7 @@ class PharmacovigilanceService:
                    VALUES(?,?,?,?,?,?,?,?)""",
                 (case_id, expected, int(serious), int(fatal), causality, rationale, actor, iso()),
             )
+            self._sync_reports_after_case_update(conn, case_id, actor, role, due, expected)
             Repository.audit(conn, case_id, actor, role, "medical_reviewed", {"from_revision": expected, "serious": serious, "fatal": fatal, "causality": causality})
             return {"case": dict(self._case(conn, case_id)), "reviewed_revision": expected}
 
@@ -332,9 +372,9 @@ class PharmacovigilanceService:
             case = self._case(conn, case_id)
             if not self.can_access(case, role, region):
                 raise ApiError(403, "region_forbidden", "不能为本区域之外案例生成报告")
-            due = report_deadline(parse_time(case["received_at"]), bool(case["serious"]), bool(case["fatal"]))
+            due = case["report_due_at"]
             try:
-                cur = conn.execute("INSERT INTO reports(case_id,country,due_at,status) VALUES(?,?,?,?)", (case_id, country, iso(due), "pending"))
+                cur = conn.execute("INSERT INTO reports(case_id,country,due_at,status) VALUES(?,?,?,?)", (case_id, country, due, "pending"))
             except sqlite3.IntegrityError as exc:
                 raise ApiError(409, "report_exists", "该国家报告已经存在") from exc
             Repository.audit(conn, case_id, actor, role, "report_created", {"report_id": cur.lastrowid, "country": country})
@@ -352,9 +392,26 @@ class PharmacovigilanceService:
             if row["status"] == "submitted":
                 return {"report": dict(row), "idempotent": True}
             now = parse_time(body.get("submitted_at"), utcnow())
+            resubmit = row["status"] == "resubmit_pending"
+            if resubmit and row["resubmit_review_revision"] is not None:
+                reviewed = conn.execute(
+                    "SELECT 1 FROM medical_reviews WHERE case_id=? AND case_revision>=? LIMIT 1",
+                    (row["case_id"], row["resubmit_review_revision"]),
+                ).fetchone()
+                if not reviewed:
+                    raise ApiError(409, "severity_review_required", "严重性尚未经医学重审，不能重报")
             late = int(now > parse_time(row["due_at"]))
-            conn.execute("UPDATE reports SET status='submitted',submitted_at=?,submitted_by=?,late=? WHERE id=?", (iso(now), actor, late, report_id))
-            Repository.audit(conn, row["case_id"], actor, role, "report_submitted", {"report_id": report_id, "country": row["country"], "late": bool(late)})
+            first_at = row["first_submitted_at"] or iso(now)
+            first_by = row["first_submitted_by"] or actor
+            conn.execute(
+                """UPDATE reports SET status='submitted',submitted_at=?,submitted_by=?,late=?,
+                   first_submitted_at=?,first_submitted_by=?,resubmit_review_revision=NULL WHERE id=?""",
+                (iso(now), actor, late, first_at, first_by, report_id),
+            )
+            action = "report_resubmitted" if resubmit else "report_submitted"
+            Repository.audit(conn, row["case_id"], actor, role, action,
+                             {"report_id": report_id, "country": row["country"], "late": bool(late),
+                              "first_submitted_by": first_by, "first_submitted_at": first_at})
             return {"report": dict(conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()), "idempotent": False}
 
     def merge_cases(self, source_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
